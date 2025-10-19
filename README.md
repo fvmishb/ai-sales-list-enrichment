@@ -1,6 +1,6 @@
 # AI Sales List Enrichment
 
-AI-powered enterprise data enrichment pipeline using Perplexity API and GPT-5-mini to process 40,000+ companies with high-quality business intelligence.
+AI-powered enterprise data enrichment pipeline using Google Custom Search API, Gemini 2.5 Flash, and GPT-5-mini to process 40,000+ companies with high-quality business intelligence.
 
 ## 🚀 Features
 
@@ -25,33 +25,34 @@ For each company, the system extracts:
 ## 🏗️ Architecture
 
 ```
-CSV Files → BigQuery Raw → Pub/Sub → Cloud Run → Cloud Tasks → Phase A/B/C → BigQuery Enriched
+CSV Files → BigQuery Raw → SimpleProcessor → Google Custom Search + Gemini 2.5 Flash + GPT-5-mini → BigQuery Enriched
 ```
 
-### Phase A: URL Discovery
-- Perplexity site-limited search
-- Categorizes URLs (about, business, products, news, legal)
-- Filters by domain to avoid false matches
+### Processing Pipeline
+1. **Google Custom Search API**: Comprehensive company information search
+   - Searches for company details, addresses, employee counts
+   - Extracts data from search results and linked pages
+   - Handles Japanese company information effectively
 
-### Phase B: Element Extraction  
-- Extracts addresses, legal names, employee counts
-- Gathers service/product headlines
-- Collects recent news (12-18 months)
+2. **Gemini 2.5 Flash**: Lightweight information extraction
+   - Processes HTML content from official websites
+   - Extracts structured data (addresses, services, products)
+   - Generates business intelligence insights
 
-### Phase C: AI Formatting
-- GPT-5-mini synthesis and formatting
-- Generates pain hypotheses based on industry + size + news
-- Creates personalization notes
-- Validates and normalizes data
+3. **GPT-5-mini**: Final formatting and synthesis
+   - Synthesizes data from multiple sources
+   - Generates pain hypotheses based on industry + size + news
+   - Creates personalization notes and validates data
 
 ## 💰 Cost Breakdown (40,000 companies)
 
 | Component | Cost | Notes |
 |-----------|------|-------|
-| **Perplexity API** | $1,200 | 80,000 calls @ $0.015/call |
+| **Google Custom Search API** | $400 | 100,000 queries @ $0.004/query |
+| **Gemini 2.5 Flash** | $200 | 20M tokens @ $0.01/1K tokens |
 | **GPT-5-mini** | $31 | 40M tokens @ $0.25/$2.00 per 1M |
 | **GCP Infrastructure** | $32 | Cloud Run, BigQuery, Tasks, Pub/Sub |
-| **Total** | **$1,263** | **$0.032 per company** |
+| **Total** | **$663** | **$0.017 per company** |
 
 ## 🚀 Quick Start
 
@@ -77,11 +78,15 @@ cd ai-sales-list
 ### 3. Configure API Keys
 
 ```bash
-# Set Perplexity API key
-echo 'your-perplexity-api-key' | gcloud secrets versions add pplx-api-key --data-file=-
+# Set Google Custom Search API key and CSE ID
+echo 'your-google-search-api-key' | gcloud secrets versions add google-search-api-key --data-file=-
+echo 'your-google-cse-id' | gcloud secrets versions add google-cse-id --data-file=-
 
 # Set OpenAI API key  
 echo 'your-openai-api-key' | gcloud secrets versions add openai-api-key --data-file=-
+
+# Set Gemini API key (optional, uses Vertex AI by default)
+echo 'your-gemini-api-key' | gcloud secrets versions add gemini-api-key --data-file=-
 ```
 
 ### 4. Upload Data
