@@ -60,3 +60,5 @@ service-account-key.json
 # Temporary files
 *.tmp
 *.temp
+infrastructure/terraform/.terraform/providers/
+infrastructure/terraform/.terraform.lock.hcl
