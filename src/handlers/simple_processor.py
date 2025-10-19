@@ -11,6 +11,7 @@ from ..services.simple_gemini_client import SimpleGeminiClient
 from ..services.openai_client import OpenAIClient
 from ..services.bigquery import BigQueryClient
 from ..services.google_custom_search_client import GoogleCustomSearchClient
+from ..services.perplexity import PerplexityClient
 from ..config import settings
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ class SimpleProcessor:
         self.gemini_client = SimpleGeminiClient()
         self.openai_client = OpenAIClient()
         self.bigquery_client = BigQueryClient()
+        self.perplexity_client = PerplexityClient()
         
     async def process_companies_simple(self, companies: List[Dict[str, Any]], 
                                      max_workers: int = 10) -> Dict[str, Any]:
@@ -105,7 +107,7 @@ class SimpleProcessor:
             return False
     
     async def _process_single_company_async(self, company: Dict[str, Any]) -> bool:
-        """単一企業の非同期処理（Google Custom Search統合版）"""
+        """単一企業の非同期処理（Perplexity Sonar統合版）"""
         try:
             company_name = company.get('name', '')
             website = company.get('website', '')
@@ -113,8 +115,47 @@ class SimpleProcessor:
             
             logger.info(f"Processing company: {company_name}")
             
-            # Step 1: Google Custom Searchで企業情報を取得
-            logger.info(f"Searching with Google Custom Search for {company_name}")
+            try:
+                logger.info(f"Attempting Perplexity Sonar API for {company_name}")
+                sonar_result = await self.perplexity_client.search_company_structured(
+                    company_name, website, industry
+                )
+                
+                if sonar_result.get('status') == 'success':
+                    sonar_data = sonar_result.get('data', {})
+                    
+                    enriched_data = {
+                        'website': website,
+                        'name': sonar_data.get('company_name', company_name),
+                        'industry': industry,
+                        'hq_address_raw': sonar_data.get('address'),
+                        'prefecture_name': sonar_data.get('prefecture'),
+                        'overview_text': sonar_data.get('company_overview'),
+                        'employee_count': sonar_data.get('employees'),
+                        'pain_hypotheses': [sonar_data.get('issues_hypothesis')] if sonar_data.get('issues_hypothesis') else [],
+                        'sources': sonar_data.get('sources', []),
+                        'services_text': [],
+                        'products_text': [],
+                        'personalization_notes': '',
+                        'status': 'ok',
+                        'signals': json.dumps({'source': 'perplexity_sonar', 'model': 'sonar-pro'})
+                    }
+                    
+                    success = await self.bigquery_client.upsert_company(enriched_data)
+                    
+                    if success:
+                        logger.info(f"Successfully processed {company_name} with Sonar API")
+                        return True
+                    else:
+                        logger.error(f"Failed to save {company_name} to BigQuery")
+                        return False
+                else:
+                    logger.warning(f"Sonar API failed for {company_name}, falling back to Google Custom Search")
+                    
+            except Exception as sonar_error:
+                logger.warning(f"Sonar API error for {company_name}: {sonar_error}, falling back to Google Custom Search")
+            
+            logger.info(f"Using fallback: Google Custom Search for {company_name}")
             custom_search_data = await self.google_search_client.search_company_info(
                 company_name, website
             )
@@ -158,7 +199,7 @@ class SimpleProcessor:
             success = await self.bigquery_client.upsert_company(enriched_data)
             
             if success:
-                logger.info(f"Successfully processed {company_name}")
+                logger.info(f"Successfully processed {company_name} with fallback method")
                 return True
             else:
                 logger.error(f"Failed to save {company_name} to BigQuery")

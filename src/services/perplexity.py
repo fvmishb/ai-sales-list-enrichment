@@ -19,7 +19,8 @@ class PerplexityClient:
         self.api_key = settings.pplx_api_key
         self.search_url = "https://api.perplexity.ai/search"
         self.chat_url = "https://api.perplexity.ai/chat/completions"
-        self.timeout = ClientTimeout(total=30)
+        self.timeout = ClientTimeout(total=60)  # Increased timeout for Sonar
+        self.sonar_model = "sonar-pro"  # Use sonar-pro for better quality
         
     async def search(self, query: str, max_results: int = 20) -> Dict[str, Any]:
         """Search for candidate URLs using Perplexity Search API."""
@@ -243,6 +244,144 @@ URL群: {', '.join(urls[:5])}
                 "company_name": company_info.get('name', ''),
                 "address_info": {},
                 "search_results": [],
+                "status": "error",
+                "error": str(e)
+            }
+    
+    async def search_company_structured(self, company_name: str, website: str, industry: str) -> Dict[str, Any]:
+        """
+        Search and extract company information using Sonar with structured JSON Schema output.
+        Based on user-provided prompt example with strict JSON validation.
+        """
+        try:
+            system_prompt = """あなたは日本企業の基礎情報を日本語で収集・要約するリサーチアシスタントです。
+出力は必ず単一のJSONオブジェクトで、提供スキーマに完全準拠させてください。
+- 住所/都道府県は会社公式サイト（会社概要/アクセス/フッター）を最優先し、本社のみ返す。
+- 従業員数は IR（有価証券報告書/統合報告/会社情報）→業界団体→Wikipedia の順。不明は null（"不明"等は不可）。
+- company_overview は150〜400文字、issues_hypothesis は100〜300文字に必ず収める（句読点や全角記号を含む文字数基準）。
+- 文体は簡潔で、事実ベース。誇張や推測を避け、課題（仮説）は直近のIR/プレス/業界動向から要約する。
+- sources は事実確認可能なURLを最大5件（公式/IR/公的/一次を優先、重複除去）。
+
+JSON schema:
+{
+  "type": "object",
+  "properties": {
+    "company_name": { "type": "string", "minLength": 1 },
+    "address": { "type": "string", "minLength": 10, "pattern": "(?s).*〒?\\\\d{3}[-‐–−]?\\\\d{4}.*" },
+    "prefecture": { "type": "string", "minLength": 2 },
+    "company_overview": { "type": "string", "minLength": 150, "maxLength": 400 },
+    "employees": { "type": ["integer","null"], "minimum": 0 },
+    "issues_hypothesis": { "type": "string", "minLength": 100, "maxLength": 300 },
+    "sources": {
+      "type": "array", "minItems": 1, "maxItems": 5, "uniqueItems": true,
+      "items": { "type": "string", "format": "uri", "pattern": "^https?://" }
+    }
+  },
+  "required": ["company_name","address","prefecture","company_overview","employees","issues_hypothesis","sources"],
+  "additionalProperties": false
+}"""
+
+            user_prompt = f"""次の企業について情報を取得し、指定のJSONスキーマで返してください。
+
+【入力】
+- 企業名: {company_name}
+- 企業URL: {website}
+- 業界: {industry}
+
+【要件】
+- 本社の「郵便番号付き」所在地（例: 〒xxx-xxxx 〇〇県…）と、都道府県名（住所から正規抽出）
+- company_overview: 150〜400文字
+- employees: 整数（単位なし）/ 不明は null
+- issues_hypothesis: 100〜300文字
+- sources: 最大5件のURL（公式/IR/プレスリリース優先）
+
+【注意】
+- 支社/工場住所は含めない。
+- 半角/全角や郵便番号は正規化して整形。"""
+
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                }
+                
+                payload = {
+                    "model": self.sonar_model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": system_prompt
+                        },
+                        {
+                            "role": "user",
+                            "content": user_prompt
+                        }
+                    ],
+                    "temperature": 0.2,  # Low temperature for consistent output
+                    "max_tokens": 2000,
+                    "stream": False
+                }
+                
+                logger.info(f"Calling Sonar API for {company_name} with model {self.sonar_model}")
+                
+                async with session.post(self.chat_url, headers=headers, json=payload) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+                        
+                        try:
+                            result = json.loads(content)
+                            
+                            required_fields = ["company_name", "address", "prefecture", "company_overview", "employees", "issues_hypothesis", "sources"]
+                            missing_fields = [field for field in required_fields if field not in result]
+                            
+                            if missing_fields:
+                                logger.warning(f"Missing required fields for {company_name}: {missing_fields}")
+                                return {
+                                    "status": "error",
+                                    "error": f"Missing required fields: {missing_fields}",
+                                    "partial_data": result
+                                }
+                            
+                            if len(result.get("company_overview", "")) < 150:
+                                logger.warning(f"company_overview too short for {company_name}: {len(result.get('company_overview', ''))} chars")
+                            
+                            if len(result.get("issues_hypothesis", "")) < 100:
+                                logger.warning(f"issues_hypothesis too short for {company_name}: {len(result.get('issues_hypothesis', ''))} chars")
+                            
+                            logger.info(f"Successfully extracted structured data for {company_name}")
+                            return {
+                                "status": "success",
+                                "data": result
+                            }
+                            
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Failed to parse JSON response for {company_name}: {e}")
+                            logger.error(f"Raw content: {content[:500]}")
+                            return {
+                                "status": "error",
+                                "error": f"JSON parse error: {str(e)}",
+                                "raw_content": content
+                            }
+                    
+                    elif response.status == 401:
+                        error_text = await response.text()
+                        logger.error(f"Sonar API authentication error 401: {error_text}")
+                        raise Exception(f"Sonar API authentication failed. Please check API key. Error: {error_text}")
+                    
+                    elif response.status == 429:
+                        error_text = await response.text()
+                        logger.error(f"Sonar API rate limit error 429: {error_text}")
+                        raise Exception(f"Sonar API rate limit exceeded: {error_text}")
+                    
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Sonar API error {response.status}: {error_text}")
+                        raise Exception(f"Sonar API error {response.status}: {error_text}")
+                        
+        except Exception as e:
+            logger.error(f"Sonar structured search failed for {company_name}: {e}")
+            return {
                 "status": "error",
                 "error": str(e)
             }
