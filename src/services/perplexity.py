@@ -19,8 +19,8 @@ class PerplexityClient:
         self.api_key = settings.pplx_api_key
         self.search_url = "https://api.perplexity.ai/search"
         self.chat_url = "https://api.perplexity.ai/chat/completions"
-        self.timeout = ClientTimeout(total=60)  # Increased timeout for Sonar
-        self.sonar_model = "sonar-pro"  # Use sonar-pro for better quality
+        self.timeout = ClientTimeout(total=120)
+        self.sonar_model = "sonar-pro"
         
     async def search(self, query: str, max_results: int = 20) -> Dict[str, Any]:
         """Search for candidate URLs using Perplexity Search API."""
