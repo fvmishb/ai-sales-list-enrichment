@@ -13,7 +13,6 @@ from .handlers.pubsub_handler import PubSubHandler
 from .handlers.task_handler import TaskHandler
 from .handlers.simple_processor import SimpleProcessor
 from .services.address_search_api import AccurateAddressSearcher
-from .services.smart_address_generator import SmartAddressGenerator
 from .config import settings
 
 # Configure logging
@@ -255,42 +254,16 @@ async def search_addresses_batch(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/generate-smart-addresses")
-async def generate_smart_addresses(request: Request):
-    """Generate smart addresses for companies with poor address quality."""
-    try:
-        body = await request.json()
-        limit = body.get("limit", 50)
-        offset = body.get("offset", 0)
-        test_mode = body.get("test_mode", False)
-        
-        logger.info(f"Starting smart address generation: limit={limit}, offset={offset}, test_mode={test_mode}")
-        
-        # Import here to avoid circular imports
-        from .services.smart_address_generator import SmartAddressGenerator
-        
-        generator = SmartAddressGenerator()
-        await generator.generate_smart_addresses(limit=limit, offset=offset, test_mode=test_mode)
-        
-        return {
-            "status": "success",
-            "message": f"Smart address generation completed for limit={limit}, offset={offset}"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in smart address generation: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/process-generic-addresses")
 async def process_generic_addresses(request: Request):
-    """Process companies with generic addresses directly."""
+    """Process companies with generic addresses using Perplexity Sonar API."""
     try:
         body = await request.json()
         limit = body.get("limit", 100)
-        max_workers = body.get("max_workers", 10)
         
-        logger.info(f"Starting generic address processing: limit={limit}, max_workers={max_workers}")
+        logger.info(f"Starting generic address processing with Perplexity Sonar API: limit={limit}")
         
         # Get companies with generic addresses from enriched table
         query = f"""
@@ -301,7 +274,8 @@ async def process_generic_addresses(request: Request):
             hq_address_raw LIKE '%推測%' OR
             hq_address_raw LIKE '%本社所在地%' OR
             hq_address_raw LIKE '%詳細住所は要確認%' OR
-            hq_address_raw LIKE '%不明%'
+            hq_address_raw LIKE '%不明%' OR
+            hq_address_raw LIKE '%内%'
         )
         ORDER BY name
         LIMIT {limit}
@@ -319,22 +293,32 @@ async def process_generic_addresses(request: Request):
         
         logger.info(f"Found {len(companies)} companies with generic addresses")
         
-        # Process companies using SimpleProcessor
+        # Process companies using SimpleProcessor with Perplexity Sonar API
         processor = SimpleProcessor()
         success_count = 0
+        error_count = 0
         
         for company in companies:
             try:
                 success = await processor._process_single_company_async(company)
                 if success:
                     success_count += 1
-                    logger.info(f"Successfully processed: {company.get('name', 'unknown')}")
+                    logger.info(f"Successfully processed with Perplexity Sonar: {company.get('name', 'unknown')}")
+                else:
+                    error_count += 1
+                    logger.warning(f"Failed to process: {company.get('name', 'unknown')}")
             except Exception as e:
+                error_count += 1
                 logger.error(f"Error processing {company.get('name', 'unknown')}: {e}")
         
         return {
             "status": "success",
-            "message": f"Processed {success_count}/{len(companies)} companies with generic addresses"
+            "message": f"Processed {success_count}/{len(companies)} companies successfully using Perplexity Sonar API",
+            "details": {
+                "total": len(companies),
+                "success": success_count,
+                "errors": error_count
+            }
         }
         
     except Exception as e:
