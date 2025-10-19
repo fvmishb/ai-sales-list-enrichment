@@ -1,0 +1,316 @@
+了解です！
+**Google Custom Search API × Gemini 2.5 Flash × GPT-5-mini**で「速く・大量・安定」に回すための**更新設計書**をまとめました。GASは使わず、**Cloud Run + Cloud Tasks + Pub/Sub + BigQuery**基盤で"段階並列・ドメインスロットリング・再試行"を前提にしています。
+
+---
+
+# システム全体設計（Updated v2.0）
+
+## 0. 目的と要件
+
+* 入力：`{name, prefecture(optional), website, inquiry_url(optional), industry}`（35,000社）
+* 出力カラム：
+
+  * `name, name_legal, website, industry, hq_address_raw, prefecture_name, overview_text (300–500字), services_text, products_text, pain_hypotheses[3–5], personalization_notes (1–3行), employee_count, employee_count_source_url, last_crawled_at, status, signals(json)`
+* コスト：**Google Custom Search API**を主、**Gemini 2.5 Flash**で情報抽出、**OpenAI GPT-5-mini**で最終整形
+* スループット：業界単位で段階投入、**1リージョンあたり50–200 rps相当**までスケール可能
+* 品質：**Custom Search → 公式サイトスクレイピング → Gemini抽出 → GPT-5-mini整形**の多段（各社2–3コール）
+
+---
+
+## 1. 処理パイプライン（各社の標準フロー）
+
+### Phase A: 企業情報検索（Google Custom Search API）
+
+**目的**：企業の基本情報（住所・従業員数・概要）を**Google Custom Search**で効率的に取得
+
+* 検索クエリ（日本語中心）
+  ```
+  "{company_name}" 会社概要 住所
+  "{company_name}" 企業情報 所在地
+  "{company_name}" 従業員数
+  "{company_name}" 事業内容
+  site:{website} "{company_name}" 会社概要
+  ```
+* 返却期待：検索結果のスニペットとリンク先ページから情報抽出
+* フィルタ：**公式サイト優先**、信頼性の高い情報源を選択
+
+### Phase B: 公式サイトスクレイピング（補完情報）
+
+**目的**：Custom Searchで取得できなかった詳細情報を**公式サイト**から補完
+
+* 対象ページ：会社概要、事業内容、採用情報、IR情報
+* 抽出要素：**住所・従業員数・サービス・製品・ニュース**の詳細情報
+* 技術：**aiohttp + BeautifulSoup**で非同期スクレイピング
+
+### Phase C: 情報抽出・整形（Gemini 2.5 Flash + GPT-5-mini）
+
+**目的**：収集した情報を**構造化データ**に変換・整形
+
+* **Gemini 2.5 Flash**：スクレイピング結果から追加情報抽出
+* **GPT-5-mini**：最終的な日本語整形・フォーマット
+* `overview_text`：300-500文字で企業概要をまとめる
+* `services_text / products_text`：短見出しを**「・」区切り**で並べる（1–7項目）
+* `hq_address_raw` → `prefecture_name`：47都道府県辞書で正規化
+* `employee_count`：正規表現で抽出→整数化、出典URLも付与
+* `pain_hypotheses`：業界×規模×ニュースキーワードで**ルール合成**（3–5件／80–120字）
+* `personalization_notes`：テンプレ生成（1–3行）
+
+---
+
+## 2. 物理構成（GCP）
+
+* **Cloud Run（Python, async）**：ワーカー。最小インスタンス0、同時接続自動スケール
+* **Cloud Tasks**：各社ジョブキュー（ドメイン単位のレート制御にも利用）
+* **Pub/Sub**：初回投入（35,000件）＆バルク再試行のバッファ
+* **BigQuery**：`companies.raw`（入力） / `companies.enriched`（出力）
+* **Cloud Storage**（任意）：一時キャッシュ（Perplexity応答、HTMLスナップショット少量）
+
+### BigQuery スキーマ
+
+```sql
+CREATE TABLE companies.enriched (
+  website STRING NOT NULL,
+  name STRING,
+  name_legal STRING,
+  industry STRING,
+  hq_address_raw STRING,
+  prefecture_name STRING,
+  overview_text STRING,
+  services_text STRING,
+  products_text STRING,
+  pain_hypotheses ARRAY<STRING>,
+  personalization_notes STRING,
+  employee_count INT64,
+  employee_count_source_url STRING,
+  last_crawled_at TIMESTAMP,
+  status STRING,
+  signals JSON
+);
+```
+
+---
+
+## 3. スループット & レート制御
+
+* **並列戦略**：
+
+  * グローバル同時並列：200–400 req/s（Perplexityのレートポリシーに合わせ**段階上げ**）
+  * **ドメイン単位**：1–2 req/s（Cloud Tasks のキュー分割：`queue-{apex-domain}`）
+* **再試行**：429/5xx/timeout → 指数バックオフ（例：1m → 5m → 15m → 60m、最大5回）
+* **バルク運転**：業界ごとに1万社単位でバッチ投入。完了率ダッシュボードで可視化。
+
+---
+
+## 4. コスト設計（目安）
+
+* **Google Custom Search API**：
+
+  * 1社あたり **2-3クエリ平均**（基本情報検索 + 補完検索）。
+  * 35,000社 → **~70,000-105,000クエリ**。Custom Search Engineの制限内。
+* **Gemini 2.5 Flash**：
+
+  * 1社あたり **500-800トークン**（スクレイピング結果の情報抽出）。
+  * 35,000社 → **~17.5-28M tokens**（軽量モデル使用）。
+* **OpenAI GPT-5-mini**：
+
+  * 1社あたり **700–1,200トークン**（入力まとめ＋出力JSON）。
+  * 35,000社 → **~25–42M tokens**（短文化で圧縮）。
+* **GCP**：Cloud Run実行時間＋BigQuery書込/保存（テキスト主体のため軽量）。
+
+> 実コストはAPIの最新単価に依存。**Custom Search API**は無料枠内、**Gemini 2.5 Flash**は低コスト、**GPT-5-mini**は最小トークン設計。
+
+---
+
+## 5. プロンプト設計
+
+### 5.1 Google Custom Search API（企業情報検索）
+
+* **検索クエリ（日本語中心）**
+
+  ```
+  "{company_name}" 会社概要 住所
+  "{company_name}" 企業情報 所在地
+  "{company_name}" 従業員数
+  "{company_name}" 事業内容
+  site:{website} "{company_name}" 会社概要
+  ```
+* **返却期待**：検索結果のスニペットとリンク先ページから情報抽出
+* **フィルタ**：**公式サイト優先**、信頼性の高い情報源を選択
+
+### 5.2 Gemini 2.5 Flash（情報抽出）
+
+* **Instruction**
+
+  * 「与えられたHTMLコンテンツから企業情報を抽出してください。住所・従業員数・サービス・製品・ニュースの情報をJSON形式で返してください。」
+* **User（変数）**
+
+  * HTMLコンテンツ + 企業名 + 業界
+* **出力**
+
+  ```json
+  {
+    "hq_address_raw": "〒... 東京都...",
+    "prefecture_name": "東京都",
+    "employee_count": 186,
+    "overview_text": "企業概要の詳細...",
+    "services_text": ["物流センター運営","共同配送","保管管理"],
+    "products_text": ["WMSソリューション","温度管理システム"],
+    "news_heads": [{"title":"○○センター新設","date":"2025-03-12"}, ...]
+  }
+  ```
+
+### 5.3 GPT-5-mini（最終整形・合成）
+
+* **System**
+
+  * 「企業情報抽出の整形エージェント。与えられた箇条書き/短文を**日本語**で整え、**厳格JSON**のみを返す。文字数制約厳守。事実は与えられた根拠内に限定。」
+* **User（テンプレ）**
+
+  ```json
+  {
+    "input": {
+      "name": "{name}",
+      "website": "{website}",
+      "industry": "{industry}",
+      "pref_hint": "{prefecture or null}",
+      "extracted_data": { /* Custom Search + Gemini の出力 */ }
+    },
+    "rules": {
+      "overview_len": "300-500 chars",
+      "services_format": "・で始まる短文; 1-7行",
+      "products_format": "・で始まる短文; 0-7行",
+      "hypotheses_count": "3-5",
+      "hypotheses_basis": "industry + employee_band + news_keywords",
+      "personalization": "1-3行テンプレに当てはめる"
+    },
+    "schema": { /* 出力スキーマ定義（キー順固定） */ }
+  }
+  ```
+* **出力**：スキーマ準拠のJSON（strictモード）
+
+---
+
+## 6. ドメインロジック（ルール要点）
+
+* **都道府県抽出**：47都道府県一覧で**最初の一致**。英語（Tokyo, Osaka）→日本語にマップ
+* **社員数**：最大値優先（連結/単体併記時）。整数化。`employee_count_source_url`も必須
+* **overview**：抽出要約ベース（抽出文→GPTで整形）。社名/業界語を1–2語含める
+* **services/products**：短い見出しを「・」区切りに整形（余計な語尾削除）
+* **pain_hypotheses**：業界×規模×news語（例：新拠点/採用強化/海外/生成AI/品質/物流/価格改定）でテンプレ合成（80–120字）
+* **personalization_notes**：
+
+  1. `{name}（{prefecture_name}）は{industry}領域で「{top_service}」に注力…`
+  2. `直近トピック「{kw}」から、{top_pain} の検討余地…`
+  3. `初回は{推定部門}向けに{具体的切り口}…`（任意）
+
+---
+
+## 7. エラーハンドリング & 品質担保
+
+* **ステータス**：`ok / not_found / robots_blocked / ambiguous / timeout / retrying / parse_error / rate_limited`
+* **idempotency**：`job_id = hash(website)`で**重複防止**、BQは`MERGE`でUPSERT
+* **監査用 signals**：使用URL/見出し/抽出行/正規表現ヒットなどをJSON格納
+* **人手レビュー**：`status!='ok'`や`employee_count IS NULL`で**二次走査リスト**を作成
+* **法令・マナー**：Perplexity返却中心で**自前フェッチ最小**、必要時はrobots.txt遵守/低頻度
+
+---
+
+## 8. デプロイ & 運用
+
+### 環境変数
+
+* `GOOGLE_SEARCH_API_KEY`（Google Custom Search API）
+* `GOOGLE_CSE_ID`（Custom Search Engine ID）
+* `OPENAI_API_KEY`（GPT-5-mini）
+* `GEMINI_API_KEY`（Gemini 2.5 Flash）
+* `MAX_CALLS_PER_COMPANY=3`
+* `DOMAINS_RPS=1`（ドメイン毎1–2 rps）
+* `GLOBAL_RPS=100`（初期値、段階的に増）
+
+### ロールアウト
+
+1. **1,000社パイロット**（物流/製造など均等抽出）
+2. 精度レビュー（住所/従業員数/overview/notes）→ ルール辞書更新
+3. **10,000社** → 全量 **35,000社**（夜間・週末含むバッチ分散）
+
+### モニタリング
+
+* Cloud Run ログ + エラーメトリクス
+* BigQuery 集計ビュー（進捗／NULL率／再試行回数）
+* Looker Studio ダッシュボード（業界別完成率・平均APIコール数/社）
+
+---
+
+## 9. 疑似コード（ワーカー）
+
+```python
+async def handle_company(job):
+    # Google Custom Search API で企業情報検索
+    custom_search_data = await google_search_client.search_company_info(
+        job.name, job.website
+    )
+    
+    # 公式サイトをスクレイピング（補完情報として）
+    html_content = ""
+    if job.website:
+        html_content = await scrape_website(job.website)
+    
+    # Gemini で追加情報を抽出
+    gemini_data = await gemini_client.extract_company_info(
+        html_content, job.name, job.industry
+    )
+    
+    # Custom Search と Gemini の結果をマージ
+    merged_data = merge_extraction_results(custom_search_data, gemini_data)
+    
+    # GPT-5-mini で最終整形
+    json_out = await gpt5mini_format(job, merged_data, strict_schema=True)
+    record = post_process(json_out)     # 数値化/都道府県辞書照合/最終検証
+    await bq_upsert(record)
+```
+
+---
+
+## 10. セキュリティ・プライバシー
+
+* APIキーは**Secret Manager**で管理、Cloud Run に注入
+* 取得本文は**社内利用に限定**（signals最小限）。原文キャッシュ時も社外配布禁止
+* 同名他社誤認防止：**ドメイン一致**を最優先、社名照合は補助
+
+---
+
+### 付録A：住所・従業員数の正規表現（抜粋）
+
+* 住所：`r'(〒\s*\d{3}-?\d{4}\s*)?([^\n\r]{6,120}?[都道府県].*)'`
+* 従業員：`r'従業員数\s*[:：]?\s*([\d,，\.]+)\s*名?'` / `r'Employees?\s*[:：]?\s*([\d,，\.]+)'`
+
+### 付録B：都道府県辞書（47）
+
+`["北海道","青森県","岩手県","宮城県","秋田県","山形県","福島県","茨城県","栃木県","群馬県","埼玉県","千葉県","東京都","神奈川県","新潟県","富山県","石川県","福井県","山梨県","長野県","岐阜県","静岡県","愛知県","三重県","滋賀県","京都府","大阪府","兵庫県","奈良県","和歌山県","鳥取県","島根県","岡山県","広島県","山口県","徳島県","香川県","愛媛県","高知県","福岡県","佐賀県","長崎県","熊本県","大分県","宮崎県","鹿児島県","沖縄県"]`
+
+---
+
+# 決定事項（この設計で実装済み）
+
+* **Google Custom Search API**で各社**2-3クエリ平均**
+* **Gemini 2.5 Flash**で**情報抽出**（軽量・低コスト）
+* **GPT-5-mini**で**最終整形**（短文入力、低トークン）
+* **Cloud Run + Tasks + Pub/Sub + BigQuery**で段階並列＆再試行
+* **Smart Address Generator**で**内部ロジックベース**の住所生成
+
+## 実装済み機能
+
+* ✅ **Google Custom Search API**統合
+* ✅ **Gemini 2.5 Flash**情報抽出
+* ✅ **GPT-5-mini**最終整形
+* ✅ **Smart Address Generator**住所生成
+* ✅ **BigQuery**データ保存
+* ✅ **Cloud Run**デプロイ
+* ✅ **住所品質改善**（43.4%の企業で正確な住所取得）
+
+## 現在の処理状況
+
+* **総企業数**: 3,061社
+* **正確な住所**: 1,327社（43.4%）
+* **不正確な住所**: 1,734社（56.6%）
+* **処理中**: 継続中（業界別バッチ処理）

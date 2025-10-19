@@ -1,0 +1,18 @@
+[
+  {"name": "website", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "name", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "name_legal", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "industry", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "hq_address_raw", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "prefecture_name", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "overview_text", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "services_text", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "products_text", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "pain_hypotheses", "type": "STRING", "mode": "REPEATED"},
+  {"name": "personalization_notes", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "employee_count", "type": "INTEGER", "mode": "NULLABLE"},
+  {"name": "employee_count_source_url", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "last_crawled_at", "type": "TIMESTAMP", "mode": "NULLABLE"},
+  {"name": "status", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "signals", "type": "JSON", "mode": "NULLABLE"}
+]
